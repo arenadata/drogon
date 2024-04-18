@@ -507,6 +507,14 @@ class TooManyConnections : public BrokenConnection
     }
 };
 
+class ConnectionCouldNotBeEstablished : public BrokenConnection
+{
+  public:
+    explicit ConnectionCouldNotBeEstablished(const std::string &err) : BrokenConnection(err)
+    {
+    }
+};
+
 // /// PL/pgSQL error
 // /** Exceptions derived from this class are errors from PL/pgSQL procedures.
 //  */

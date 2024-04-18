@@ -436,12 +436,23 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
         }
         // Reconnect after 1 second
         auto loop = closeConnPtr->loop();
-        loop->runAfter(1, [weakPtr, loop, closeConnPtr] {
+        trantor::TimerId reconnect_timer_id = loop->runEvery(
+            1, [weakPtr, loop, closeConnPtr, reconnect_timer_id] {
             auto thisPtr = weakPtr.lock();
             if (!thisPtr)
                 return;
             std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
-            thisPtr->connections_.insert(thisPtr->newConnection(loop));
+
+                try
+                {
+                    auto connection = thisPtr->newConnection(loop);
+                    thisPtr->connections_.insert(connection);
+                    loop->invalidateTimer(reconnect_timer_id);
+                }
+                catch (const BrokenConnection &e)
+                {
+                    LOG_ERROR << "Connection error: " << e.what();
+                }
         });
     });
     connPtr->setOkCallback([weakPtr](const DbConnectionPtr &okConnPtr) {

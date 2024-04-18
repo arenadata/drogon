@@ -90,10 +90,7 @@ PgConnection::PgConnection(trantor::EventLoop *loop,
     PQsetnonblocking(connectionPtr_.get(), 1);
     if (channel_.fd() < 0)
     {
-        LOG_FATAL << "Socket fd < 0, Usually this is because the number of "
-                     "files opened by the program exceeds the system "
-                     "limit. Please use the ulimit command to check.";
-        exit(1);
+        throw ConnectionCouldNotBeEstablished("Connection with Postgres database could not be established.");
     }
     channel_.setReadCallback([this]() {
         if (status_ == ConnectStatus::Bad)
