@@ -443,16 +443,16 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
                 return;
             std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
 
-                try
-                {
-                    auto connection = thisPtr->newConnection(loop);
-                    thisPtr->connections_.insert(connection);
-                    loop->invalidateTimer(reconnect_timer_id);
-                }
-                catch (const BrokenConnection &e)
-                {
-                    LOG_ERROR << "Connection error: " << e.what();
-                }
+            try
+            {
+                auto connection = thisPtr->newConnection(loop);
+                thisPtr->connections_.insert(connection);
+                loop->invalidateTimer(reconnect_timer_id);
+            }
+            catch (const BrokenConnection &e)
+            {
+                LOG_ERROR << "Connection error: " << e.what();
+            }
         });
     });
     connPtr->setOkCallback([weakPtr](const DbConnectionPtr &okConnPtr) {
