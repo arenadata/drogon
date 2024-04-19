@@ -120,7 +120,8 @@ MysqlConnection::MysqlConnection(trantor::EventLoop *loop,
         auto fd = mysql_get_socket(mysqlPtr_.get());
         if (fd < 0)
         {
-            throw ConnectionCouldNotBeEstablished("Connection with Postgres database could not be established.");
+            throw ConnectionCouldNotBeEstablished(
+                "Connection with Postgres database could not be established.");
         }
         channelPtr_ = std::make_unique<trantor::Channel>(loop_, fd);
         channelPtr_->setEventCallback([this]() { handleEvent(); });

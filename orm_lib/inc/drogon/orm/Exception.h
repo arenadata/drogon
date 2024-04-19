@@ -510,7 +510,8 @@ class TooManyConnections : public BrokenConnection
 class ConnectionCouldNotBeEstablished : public BrokenConnection
 {
   public:
-    explicit ConnectionCouldNotBeEstablished(const std::string &err) : BrokenConnection(err)
+    explicit ConnectionCouldNotBeEstablished(const std::string &err)
+        : BrokenConnection(err)
     {
     }
 };

@@ -68,7 +68,8 @@ PgConnection::PgConnection(trantor::EventLoop *loop,
     PQsetnonblocking(connectionPtr_.get(), 1);
     if (channel_.fd() < 0)
     {
-        throw ConnectionCouldNotBeEstablished("Connection with Postgres database could not be established.");
+        throw ConnectionCouldNotBeEstablished(
+            "Connection with Postgres database could not be established.");
     }
     channel_.setReadCallback([this]() {
         if (status_ == ConnectStatus::Bad)

@@ -434,26 +434,28 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
                    thisPtr->connections_.end());
             thisPtr->connections_.erase(closeConnPtr);
         }
-        // Reconnect after 1 second
-        auto loop = closeConnPtr->loop();
-        trantor::TimerId reconnect_timer_id = loop->runEvery(
-            1, [weakPtr, loop, closeConnPtr, reconnect_timer_id] {
-            auto thisPtr = weakPtr.lock();
-            if (!thisPtr)
-                return;
-            std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
 
-            try
-            {
-                auto connection = thisPtr->newConnection(loop);
-                thisPtr->connections_.insert(connection);
-                loop->invalidateTimer(reconnect_timer_id);
-            }
-            catch (const BrokenConnection &e)
-            {
-                LOG_ERROR << "Connection error: " << e.what();
-            }
-        });
+        auto timerIdPtr = std::make_shared<std::atomic<trantor::TimerId>>(
+            trantor::InvalidTimerId);
+        auto loop = closeConnPtr->loop();
+        *timerIdPtr =
+            loop->runEvery(1, [weakPtr, loop, closeConnPtr, timerIdPtr] {
+                auto thisPtr = weakPtr.lock();
+                if (!thisPtr || *timerIdPtr == trantor::InvalidTimerId)
+                    return;
+                std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
+
+                try
+                {
+                    auto connection = thisPtr->newConnection(loop);
+                    thisPtr->connections_.insert(connection);
+                    loop->invalidateTimer(*timerIdPtr);
+                }
+                catch (const BrokenConnection &e)
+                {
+                    LOG_ERROR << "Connection error: " << e.what();
+                }
+            });
     });
     connPtr->setOkCallback([weakPtr](const DbConnectionPtr &okConnPtr) {
         LOG_TRACE << "connected!";
