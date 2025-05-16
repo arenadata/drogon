@@ -68,29 +68,37 @@ DbClientImpl::DbClientImpl(const std::string &connInfo,
 {
     type_ = type;
     connectionInfo_ = connInfo;
-    LOG_TRACE << "type=" << (int)type;
+    LOG_TRACE << "DbClientImpl constructor: type=" << (int)type
+              << ", connections=" << connNum;
     assert(connNum > 0);
 }
 
 void DbClientImpl::init()
 {
-    // LOG_DEBUG << loops_.getLoopNum();
+    LOG_DEBUG << "Initializing DbClientImpl with " << numberOfConnections_
+              << " connections";
     loops_.start();
     if (type_ == ClientType::PostgreSQL || type_ == ClientType::Mysql)
     {
+        LOG_INFO << "Starting " << numberOfConnections_ << " connections for "
+                 << (type_ == ClientType::PostgreSQL ? "PostgreSQL" : "MySQL");
         for (size_t i = 0; i < numberOfConnections_; ++i)
         {
             auto loop = loops_.getNextLoop();
+            LOG_TRACE << "Creating connection " << i + 1 << " on loop " << loop;
             loop->runInLoop([this, loop]() { newConnection(loop); });
         }
     }
     else if (type_ == ClientType::Sqlite3)
     {
+        LOG_INFO << "Starting " << numberOfConnections_
+                 << " connections for SQLite3";
         sharedMutexPtr_ = std::make_shared<SharedMutex>();
         assert(sharedMutexPtr_);
 
         for (size_t i = 0; i < numberOfConnections_; ++i)
         {
+            LOG_TRACE << "Creating SQLite3 connection " << i + 1;
             newConnection(nullptr);
         }
     }
@@ -98,11 +106,13 @@ void DbClientImpl::init()
 
 DbClientImpl::~DbClientImpl() noexcept
 {
+    LOG_DEBUG << "DbClientImpl destructor called";
     closeAll();
 }
 
 void DbClientImpl::closeAll()
 {
+    LOG_INFO << "Closing all database connections";
     decltype(connections_) connections;
     {
         std::lock_guard<std::mutex> lock(connectionsMutex_);
@@ -110,6 +120,7 @@ void DbClientImpl::closeAll()
         readyConnections_.clear();
         busyConnections_.clear();
     }
+    LOG_DEBUG << "Disconnecting " << connections.size() << " connections";
     for (auto const &conn : connections)
     {
         conn->disconnect();
@@ -126,12 +137,15 @@ void DbClientImpl::execSql(
     ResultCallback &&rcb,
     std::function<void(const std::exception_ptr &)> &&exceptCallback)
 {
+    LOG_TRACE << "Executing SQL with " << paraNum << " parameters";
     assert(paraNum == parameters.size());
     assert(paraNum == length.size());
     assert(paraNum == format.size());
     assert(rcb);
     if (timeout_ > 0.0)
     {
+        LOG_TRACE << "Using timeout of " << timeout_
+                  << " seconds for SQL execution";
         execSqlWithTimeout(sql,
                            sqlLength,
                            paraNum,
@@ -151,12 +165,15 @@ void DbClientImpl::execSql(
         {
             if (sqlCmdBuffer_.size() > 200000)
             {
-                // too many queries in buffer;
+                LOG_ERROR << "Too many queries in buffer ("
+                          << sqlCmdBuffer_.size() << "), rejecting new query";
                 busy = true;
             }
             else
             {
-                // LOG_TRACE << "Push query to buffer";
+                LOG_DEBUG
+                    << "No ready connections, pushing query to buffer (size: "
+                    << sqlCmdBuffer_.size() << ")";
                 std::shared_ptr<SqlCmd> cmd =
                     std::make_shared<SqlCmd>(std::string_view{sql, sqlLength},
                                              paraNum,
@@ -174,10 +191,15 @@ void DbClientImpl::execSql(
             busyConnections_.insert(*iter);
             conn = *iter;
             readyConnections_.erase(iter);
+            LOG_TRACE << "Using ready connection for SQL execution, ready "
+                         "connections: "
+                      << readyConnections_.size()
+                      << ", busy connections: " << busyConnections_.size();
         }
     }
     if (conn)
     {
+        LOG_TRACE << "Executing SQL on connection";
         conn->execSql({sql, sqlLength},
                       paraNum,
                       std::move(parameters),
@@ -189,6 +211,7 @@ void DbClientImpl::execSql(
     }
     if (busy)
     {
+        LOG_ERROR << "Rejecting SQL execution due to buffer overflow";
         auto exceptPtr =
             std::make_exception_ptr(Failure("Too many queries in buffer"));
         exceptCallback(exceptPtr);
@@ -199,6 +222,7 @@ void DbClientImpl::execSql(
 void DbClientImpl::newTransactionAsync(
     const std::function<void(const std::shared_ptr<Transaction> &)> &callback)
 {
+    LOG_TRACE << "Creating new transaction asynchronously";
     DbConnectionPtr conn;
     {
         std::lock_guard<std::mutex> lock(connectionsMutex_);
@@ -208,14 +232,21 @@ void DbClientImpl::newTransactionAsync(
             busyConnections_.insert(*iter);
             conn = *iter;
             readyConnections_.erase(iter);
+            LOG_DEBUG
+                << "Using ready connection for transaction, ready connections: "
+                << readyConnections_.size()
+                << ", busy connections: " << busyConnections_.size();
         }
         else
         {
+            LOG_DEBUG << "No ready connections, queueing transaction callback";
             auto callbackPtr = std::make_shared<
                 std::function<void(const std::shared_ptr<Transaction> &)>>(
                 callback);
             if (timeout_ > 0.0)
             {
+                LOG_TRACE << "Setting up transaction timeout of " << timeout_
+                          << " seconds";
                 auto newCallbackPtr =
                     std::make_shared<std::weak_ptr<std::function<void(
                         const std::shared_ptr<Transaction> &)>>>();
@@ -223,6 +254,8 @@ void DbClientImpl::newTransactionAsync(
                     loops_.getNextLoop(),
                     std::chrono::duration<double>(timeout_),
                     [newCallbackPtr, callbackPtr, this]() {
+                        LOG_ERROR << "Transaction creation timed out after "
+                                  << timeout_ << " seconds";
                         auto cbPtr = (*newCallbackPtr).lock();
                         if (cbPtr)
                         {
@@ -266,14 +299,17 @@ void DbClientImpl::makeTrans(
     const DbConnectionPtr &conn,
     std::function<void(const std::shared_ptr<Transaction> &)> &&callback)
 {
+    LOG_DEBUG << "Creating new transaction on connection";
     std::weak_ptr<DbClientImpl> weakThis = shared_from_this();
     auto trans = std::make_shared<TransactionImpl>(
         type_, conn, std::function<void(bool)>(), [weakThis, conn]() {
+            LOG_TRACE << "Transaction callback executed";
             auto thisPtr = weakThis.lock();
             if (!thisPtr)
                 return;
             if (conn->status() == ConnectStatus::Bad)
             {
+                LOG_ERROR << "Connection is in bad status, cannot reuse";
                 return;
             }
             {
@@ -281,6 +317,7 @@ void DbClientImpl::makeTrans(
                 if (thisPtr->connections_.find(conn) ==
                     thisPtr->connections_.end())
                 {
+                    LOG_ERROR << "Connection is broken and removed";
                     // connection is broken and removed
                     assert(thisPtr->busyConnections_.find(conn) ==
                                thisPtr->busyConnections_.end() &&
@@ -310,6 +347,8 @@ void DbClientImpl::makeTrans(
     trans->doBegin();
     if (timeout_ > 0.0)
     {
+        LOG_TRACE << "Setting transaction timeout to " << timeout_
+                  << " seconds";
         trans->setTimeout(timeout_);
     }
     conn->loop()->queueInLoop(
@@ -319,6 +358,7 @@ void DbClientImpl::makeTrans(
 std::shared_ptr<Transaction> DbClientImpl::newTransaction(
     const std::function<void(bool)> &commitCallback) noexcept(false)
 {
+    LOG_DEBUG << "Creating new transaction synchronously";
     std::promise<std::shared_ptr<Transaction>> pro;
     auto f = pro.get_future();
     newTransactionAsync([&pro](const std::shared_ptr<Transaction> &trans) {
@@ -327,30 +367,38 @@ std::shared_ptr<Transaction> DbClientImpl::newTransaction(
     auto trans = f.get();
     if (!trans)
     {
+        LOG_ERROR << "Failed to create transaction: timeout or no connection "
+                     "available";
         throw TimeoutError("Timeout, no connection available for transaction");
     }
+    LOG_TRACE << "Transaction created successfully";
     trans->setCommitCallback(commitCallback);
     return trans;
 }
 
 void DbClientImpl::handleNewTask(const DbConnectionPtr &connPtr)
 {
+    LOG_TRACE << "Handling new task on connection";
     std::function<void(const std::shared_ptr<Transaction> &)> transCallback;
     std::shared_ptr<SqlCmd> cmd;
     {
         std::lock_guard<std::mutex> guard(connectionsMutex_);
         if (!transCallbacks_.empty())
         {
+            LOG_DEBUG << "Processing pending transaction callback";
             transCallback = std::move(*(transCallbacks_.front()));
             transCallbacks_.pop_front();
         }
         else if (!sqlCmdBuffer_.empty())
         {
+            LOG_DEBUG << "Processing pending SQL command from buffer (size: "
+                      << sqlCmdBuffer_.size() << ")";
             cmd = std::move(sqlCmdBuffer_.front());
             sqlCmdBuffer_.pop_front();
         }
         else
         {
+            LOG_TRACE << "No pending tasks, marking connection as ready";
             // Connection is idle, put it into the readyConnections_ set;
             busyConnections_.erase(connPtr);
             readyConnections_.insert(connPtr);
@@ -358,11 +406,13 @@ void DbClientImpl::handleNewTask(const DbConnectionPtr &connPtr)
     }
     if (transCallback)
     {
+        LOG_TRACE << "Executing transaction callback";
         makeTrans(connPtr, std::move(transCallback));
         return;
     }
     if (cmd)
     {
+        LOG_TRACE << "Executing SQL command from buffer";
         connPtr->execSql(std::move(cmd->sql_),
                          cmd->parametersNumber_,
                          std::move(cmd->parameters_),
@@ -376,45 +426,56 @@ void DbClientImpl::handleNewTask(const DbConnectionPtr &connPtr)
 
 DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
 {
+    LOG_DEBUG << "Creating new database connection";
     DbConnectionPtr connPtr;
     if (type_ == ClientType::PostgreSQL)
     {
 #if USE_POSTGRESQL
 #if LIBPQ_SUPPORTS_BATCH_MODE
+        LOG_INFO << "Creating new PostgreSQL connection with batch mode "
+                 << (autoBatch_ ? "enabled" : "disabled");
         connPtr =
             std::make_shared<PgConnection>(loop, connectionInfo_, autoBatch_);
 #else
+        LOG_INFO << "Creating new PostgreSQL connection";
         connPtr = std::make_shared<PgConnection>(loop, connectionInfo_, false);
 #endif
 #else
+        LOG_ERROR << "PostgreSQL support not enabled";
         return nullptr;
 #endif
     }
     else if (type_ == ClientType::Mysql)
     {
 #if USE_MYSQL
+        LOG_INFO << "Creating new MySQL connection";
         connPtr = std::make_shared<MysqlConnection>(loop, connectionInfo_);
 #else
+        LOG_ERROR << "MySQL support not enabled";
         return nullptr;
 #endif
     }
     else if (type_ == ClientType::Sqlite3)
     {
 #if USE_SQLITE3
+        LOG_INFO << "Creating new SQLite3 connection";
         connPtr = std::make_shared<Sqlite3Connection>(loop,
                                                       connectionInfo_,
                                                       sharedMutexPtr_);
 #else
+        LOG_ERROR << "SQLite3 support not enabled";
         return nullptr;
 #endif
     }
     else
     {
+        LOG_ERROR << "Unknown database type: " << static_cast<int>(type_);
         return nullptr;
         (void)(loop);
     }
     std::weak_ptr<DbClientImpl> weakPtr = shared_from_this();
     connPtr->setCloseCallback([weakPtr](const DbConnectionPtr &closeConnPtr) {
+        LOG_INFO << "Connection closed, removing from connection pools";
         // Erase the connection
         auto thisPtr = weakPtr.lock();
         if (!thisPtr)
@@ -426,21 +487,26 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
             assert(thisPtr->connections_.find(closeConnPtr) !=
                    thisPtr->connections_.end());
             thisPtr->connections_.erase(closeConnPtr);
+            LOG_DEBUG
+                << "Connection removed from pools, remaining connections: "
+                << thisPtr->connections_.size();
         }
         // Reconnect after 1 second
         auto loop = closeConnPtr->loop();
         // closeConnPtr may be not valid. Close the connection file descriptor.
         closeConnPtr->disconnect();
+        LOG_INFO << "Scheduling reconnection attempt in 1 second";
         loop->runAfter(1, [weakPtr, loop, closeConnPtr] {
             auto thisPtr = weakPtr.lock();
             if (!thisPtr)
                 return;
-
+            LOG_DEBUG << "Attempting to reconnect after connection failure";
             thisPtr->newConnection(loop);
         });
     });
+
     connPtr->setOkCallback([weakPtr](const DbConnectionPtr &okConnPtr) {
-        LOG_TRACE << "connected!";
+        LOG_INFO << "Database connection established successfully";
         auto thisPtr = weakPtr.lock();
         if (!thisPtr)
             return;
@@ -449,11 +515,15 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
             thisPtr->busyConnections_.insert(
                 okConnPtr);  // For new connections, this sentence is
                              // necessary
+            LOG_DEBUG << "Connection added to busy pool, busy connections: "
+                      << thisPtr->busyConnections_.size();
         }
         thisPtr->handleNewTask(okConnPtr);
     });
+
     std::weak_ptr<DbConnection> weakConn = connPtr;
     connPtr->setIdleCallback([weakPtr, weakConn]() {
+        LOG_TRACE << "Connection idle callback triggered";
         auto thisPtr = weakPtr.lock();
         if (!thisPtr)
             return;
@@ -466,20 +536,28 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
     {
         std::lock_guard<std::mutex> guard(connectionsMutex_);
         connections_.insert(connPtr);
+        LOG_DEBUG << "Connection added to connections pool, total connections: "
+                  << connections_.size();
     }
 
     // Init database connection only after all callbacks are set and connPtr
     // is added to connections_.
+    LOG_TRACE << "Initializing database connection";
     connPtr->init();
 
-    // std::cout<<"newConn end"<<connPtr<<std::endl;
     return connPtr;
 }
 
 bool DbClientImpl::hasAvailableConnections() const noexcept
 {
     std::lock_guard<std::mutex> lock(connectionsMutex_);
-    return (!readyConnections_.empty()) || (!busyConnections_.empty());
+    bool hasConnections =
+        (!readyConnections_.empty()) || (!busyConnections_.empty());
+    LOG_TRACE << "Checking for available connections: "
+              << (hasConnections ? "available" : "none available")
+              << " (ready: " << readyConnections_.size()
+              << ", busy: " << busyConnections_.size() << ")";
+    return hasConnections;
 }
 
 void DbClientImpl::execSqlWithTimeout(
@@ -492,6 +570,7 @@ void DbClientImpl::execSqlWithTimeout(
     ResultCallback &&rcb,
     std::function<void(const std::exception_ptr &)> &&ecb)
 {
+    LOG_TRACE << "Executing SQL with timeout of " << timeout_ << " seconds";
     DbConnectionPtr conn;
     assert(timeout_ > 0.0);
     auto cmd = std::make_shared<std::weak_ptr<SqlCmd>>();
@@ -499,10 +578,14 @@ void DbClientImpl::execSqlWithTimeout(
     auto ecpPtr =
         std::make_shared<std::function<void(const std::exception_ptr &)>>(
             std::move(ecb));
+
+    LOG_DEBUG << "Setting up timeout flag for SQL execution";
     auto timeoutFlagPtr = std::make_shared<drogon::TaskTimeoutFlag>(
         loops_.getNextLoop(),
         std::chrono::duration<double>(timeout_),
-        [cmd, ecpPtr, thisPtr = shared_from_this()]() {
+        [cmd, ecpPtr, thisPtr = shared_from_this(), timeout = timeout_]() {
+            LOG_ERROR << "SQL execution timed out after " << timeout
+                      << " seconds";
             auto cbPtr = (*cmd).lock();
             if (cbPtr)
             {
@@ -513,6 +596,8 @@ void DbClientImpl::execSqlWithTimeout(
                 {
                     if (*iter == cbPtr)
                     {
+                        LOG_DEBUG
+                            << "Removing timed out SQL command from buffer";
                         thisPtr->sqlCmdBuffer_.erase(iter);
                         break;
                     }
@@ -521,17 +606,28 @@ void DbClientImpl::execSqlWithTimeout(
             (*ecpPtr)(
                 std::make_exception_ptr(TimeoutError("SQL execution timeout")));
         });
+
     auto resultCallback = [rcb = std::move(rcb),
                            timeoutFlagPtr](const Result &result) {
         if (timeoutFlagPtr->done())
+        {
+            LOG_TRACE << "Ignoring SQL result callback as operation already "
+                         "timed out";
             return;
+        }
+        LOG_TRACE << "SQL execution completed successfully";
         rcb(result);
     };
 
     auto exceptionCallback = [ecpPtr,
                               timeoutFlagPtr](const std::exception_ptr &err) {
         if (timeoutFlagPtr->done())
+        {
+            LOG_TRACE << "Ignoring SQL exception callback as operation already "
+                         "timed out";
             return;
+        }
+        LOG_ERROR << "SQL execution failed with exception";
         (*ecpPtr)(err);
     };
 
@@ -542,12 +638,15 @@ void DbClientImpl::execSqlWithTimeout(
         {
             if (sqlCmdBuffer_.size() > 200000)
             {
-                // too many queries in buffer;
+                LOG_ERROR << "Too many queries in buffer ("
+                          << sqlCmdBuffer_.size() << "), rejecting new query";
                 busy = true;
             }
             else
             {
-                // LOG_TRACE << "Push query to buffer";
+                LOG_DEBUG
+                    << "No ready connections, pushing query to buffer (size: "
+                    << sqlCmdBuffer_.size() << ")";
                 auto command =
                     std::make_shared<SqlCmd>(std::string_view{sql, sqlLength},
                                              paraNum,
@@ -566,10 +665,15 @@ void DbClientImpl::execSqlWithTimeout(
             busyConnections_.insert(*iter);
             conn = *iter;
             readyConnections_.erase(iter);
+            LOG_TRACE << "Using ready connection for SQL execution, ready "
+                         "connections: "
+                      << readyConnections_.size()
+                      << ", busy connections: " << busyConnections_.size();
         }
     }
     if (conn)
     {
+        LOG_DEBUG << "Executing SQL on connection with timeout";
         conn->execSql(std::string_view{sql, sqlLength},
                       paraNum,
                       std::move(parameters),
@@ -583,10 +687,12 @@ void DbClientImpl::execSqlWithTimeout(
 
     if (busy)
     {
+        LOG_ERROR << "Rejecting SQL execution due to buffer overflow";
         exceptionCallback(
             std::make_exception_ptr(Failure("Too many queries in buffer")));
         return;
     }
 
+    LOG_TRACE << "Starting timeout timer for queued SQL execution";
     timeoutFlagPtr->runTimer();
 }

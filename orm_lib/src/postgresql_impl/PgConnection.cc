@@ -39,10 +39,12 @@ Result makeResult(std::shared_ptr<PGresult> &&r = nullptr)
 int PgConnection::flush()
 {
     auto ret = PQflush(connectionPtr_.get());
+    LOG_TRACE << "PQflush returned " << ret;
     if (ret == 1)
     {
         if (!channel_.isWriting())
         {
+            LOG_TRACE << "Enabling writing on channel";
             channel_.enableWriting();
         }
     }
@@ -50,9 +52,15 @@ int PgConnection::flush()
     {
         if (channel_.isWriting())
         {
+            LOG_TRACE << "Disabling writing on channel";
             channel_.disableWriting();
         }
     }
+    else if (ret < 0)
+    {
+        LOG_ERROR << "PQflush error: " << PQerrorMessage(connectionPtr_.get());
+    }
+
     return ret;
 }
 
@@ -65,17 +73,25 @@ PgConnection::PgConnection(trantor::EventLoop *loop,
                                   [](PGconn *conn) { PQfinish(conn); })),
       channel_(loop, PQsocket(connectionPtr_.get()))
 {
+    LOG_DEBUG << "Creating PostgreSQL connection";
     if (channel_.fd() < 0)
     {
-        LOG_ERROR << "Failed to create Postgres connection";
+        LOG_ERROR << "Failed to create PostgreSQL connection, invalid socket: "
+                  << PQerrorMessage(connectionPtr_.get());
+    }
+    else
+    {
+        LOG_DEBUG << "PostgreSQL connection socket created: " << channel_.fd();
     }
 }
 
 void PgConnection::init()
 {
+    LOG_DEBUG << "Initializing PostgreSQL connection";
     if (channel_.fd() < 0)
     {
-        LOG_ERROR << "Connection with Postgres could not be established";
+        LOG_ERROR << "Connection with PostgreSQL could not be established: "
+                  << PQerrorMessage(connectionPtr_.get());
         if (closeCallback_)
         {
             auto thisPtr = shared_from_this();
@@ -84,6 +100,7 @@ void PgConnection::init()
         return;
     }
 
+    LOG_DEBUG << "Setting PostgreSQL connection to non-blocking mode";
     PQsetnonblocking(connectionPtr_.get(), 1);
     channel_.setReadCallback([this]() {
         if (status_ == ConnectStatus::Bad)
@@ -102,27 +119,37 @@ void PgConnection::init()
     channel_.setWriteCallback([this]() {
         if (status_ == ConnectStatus::Ok)
         {
+            LOG_TRACE << "Handling write event, flushing PostgreSQL connection";
             auto ret = PQflush(connectionPtr_.get());
             if (ret == 0)
             {
+                LOG_TRACE << "PQflush completed, disabling writing";
                 channel_.disableWriting();
                 return;
             }
             else if (ret < 0)
             {
                 channel_.disableWriting();
-                LOG_ERROR << "PQflush error:"
+                LOG_ERROR << "PQflush error: "
                           << PQerrorMessage(connectionPtr_.get());
                 return;
             }
         }
         else
         {
+            LOG_TRACE << "Connection not ready, polling PostgreSQL connection";
             pgPoll();
         }
     });
-    channel_.setCloseCallback([this]() { handleClosed(); });
-    channel_.setErrorCallback([this]() { handleClosed(); });
+    channel_.setCloseCallback([this]() {
+        LOG_INFO << "Channel closed for PostgreSQL connection";
+        handleClosed();
+    });
+    channel_.setErrorCallback([this]() {
+        LOG_ERROR << "Channel error for PostgreSQL connection";
+        handleClosed();
+    });
+    LOG_DEBUG << "Enabling reading and writing on PostgreSQL connection";
     channel_.enableReading();
     channel_.enableWriting();
 }
@@ -130,18 +157,25 @@ void PgConnection::init()
 void PgConnection::handleClosed()
 {
     loop_->assertInLoopThread();
+    LOG_INFO << "Handling closed PostgreSQL connection";
     if (status_ == ConnectStatus::Bad)
+    {
+        LOG_TRACE << "Connection already marked as Bad, ignoring close event";
         return;
+    }
     status_ = ConnectStatus::Bad;
 
     if (isWorking_)
     {
-        // Connection was closed unexpectedly while isWorking_ was true.
+        LOG_WARN << "PostgreSQL connection closed unexpectedly while "
+                    "processing a query";
         isWorking_ = false;
         handleFatalError();
         callback_ = nullptr;
     }
 
+    LOG_DEBUG
+        << "Disabling and removing channel for closed PostgreSQL connection";
     channel_.disableAll();
     channel_.remove();
     assert(closeCallback_);
@@ -151,42 +185,51 @@ void PgConnection::handleClosed()
 
 void PgConnection::disconnect()
 {
+    LOG_INFO << "Disconnecting from PostgreSQL server";
     std::promise<int> pro;
     auto f = pro.get_future();
     auto thisPtr = shared_from_this();
     loop_->runInLoop([thisPtr, &pro]() {
+        LOG_DEBUG << "Executing disconnect in loop";
         thisPtr->status_ = ConnectStatus::Bad;
         if (thisPtr->channel_.fd() >= 0)
         {
+            LOG_DEBUG << "Closing channel with fd: " << thisPtr->channel_.fd();
             thisPtr->channel_.disableAll();
             thisPtr->channel_.remove();
         }
         thisPtr->connectionPtr_.reset();
+        LOG_DEBUG << "PostgreSQL connection resources released";
         pro.set_value(1);
     });
     f.get();
+    LOG_INFO << "PostgreSQL disconnect completed";
 }
 
 void PgConnection::pgPoll()
 {
     loop_->assertInLoopThread();
+    LOG_TRACE << "Polling PostgreSQL connection";
     auto connStatus = PQconnectPoll(connectionPtr_.get());
 
     switch (connStatus)
     {
         case PGRES_POLLING_FAILED:
-            LOG_ERROR << "!!!Pg connection failed: "
+            LOG_ERROR << "PostgreSQL connection failed: "
                       << PQerrorMessage(connectionPtr_.get());
             if (status_ == ConnectStatus::None)
             {
+                LOG_INFO << "Handling connection failure";
                 handleClosed();
             }
             break;
         case PGRES_POLLING_WRITING:
+            LOG_TRACE << "PostgreSQL connection needs write operation";
             if (!channel_.isWriting())
                 channel_.enableWriting();
             break;
         case PGRES_POLLING_READING:
+            LOG_TRACE << "PostgreSQL connection needs read operation";
             if (!channel_.isReading())
                 channel_.enableReading();
             if (channel_.isWriting())
@@ -194,6 +237,7 @@ void PgConnection::pgPoll()
             break;
 
         case PGRES_POLLING_OK:
+            LOG_DEBUG << "PostgreSQL connection established successfully";
             if (status_ != ConnectStatus::Ok)
             {
                 status_ = ConnectStatus::Ok;
@@ -206,9 +250,10 @@ void PgConnection::pgPoll()
                 channel_.disableWriting();
             break;
         case PGRES_POLLING_ACTIVE:
-            // unused!
+            LOG_TRACE << "PostgreSQL connection polling active (unused state)";
             break;
         default:
+            LOG_WARN << "Unknown PostgreSQL polling status: " << connStatus;
             break;
     }
 }
@@ -222,7 +267,7 @@ void PgConnection::execSqlInLoop(
     ResultCallback &&rcb,
     std::function<void(const std::exception_ptr &)> &&exceptCallback)
 {
-    LOG_TRACE << sql;
+    LOG_TRACE << "Executing SQL: " << sql;
     loop_->assertInLoopThread();
     assert(paraNum == parameters.size());
     assert(paraNum == length.size());
@@ -239,7 +284,7 @@ void PgConnection::execSqlInLoop(
         isPreparingStatement_ = false;
         if (PQsendQuery(connectionPtr_.get(), sql_.data()) == 0)
         {
-            LOG_ERROR << "send query error: "
+            LOG_ERROR << "Failed to send query: "
                       << PQerrorMessage(connectionPtr_.get());
             if (isWorking_)
             {
@@ -258,6 +303,7 @@ void PgConnection::execSqlInLoop(
         auto iter = preparedStatementsMap_.find(sql_);
         if (iter != preparedStatementsMap_.end())
         {
+            LOG_TRACE << "Executing prepared statement: " << iter->second;
             isPreparingStatement_ = false;
             if (PQsendQueryPrepared(connectionPtr_.get(),
                                     iter->second.c_str(),
@@ -267,7 +313,7 @@ void PgConnection::execSqlInLoop(
                                     format.data(),
                                     0) == 0)
             {
-                LOG_ERROR << "send query error: "
+                LOG_ERROR << "Failed to send prepared query: "
                           << PQerrorMessage(connectionPtr_.get());
                 if (isWorking_)
                 {
@@ -290,7 +336,7 @@ void PgConnection::execSqlInLoop(
                               static_cast<int>(paraNum),
                               nullptr) == 0)
             {
-                LOG_ERROR << "send query error: "
+                LOG_ERROR << "Failed to prepare statement: "
                           << PQerrorMessage(connectionPtr_.get());
                 if (isWorking_)
                 {
@@ -317,7 +363,7 @@ void PgConnection::handleRead()
 
     if (!PQconsumeInput(connectionPtr_.get()))
     {
-        LOG_ERROR << "Failed to consume pg input:"
+        LOG_ERROR << "Failed to consume PostgreSQL input: "
                   << PQerrorMessage(connectionPtr_.get());
         if (isWorking_)
         {
@@ -333,13 +379,20 @@ void PgConnection::handleRead()
         // need read more data from socket;
         return;
     }
+
+    int resultCount = 0;
     while ((res = std::shared_ptr<PGresult>(PQgetResult(connectionPtr_.get()),
                                             [](PGresult *p) { PQclear(p); })))
     {
+        resultCount++;
         auto type = PQresultStatus(res.get());
+        LOG_TRACE << "Got PostgreSQL result #" << resultCount
+                  << " with status: " << PQresStatus(type);
+
         if (type == PGRES_BAD_RESPONSE || type == PGRES_FATAL_ERROR)
         {
-            LOG_WARN << PQerrorMessage(connectionPtr_.get());
+            LOG_WARN << "PostgreSQL error: "
+                     << PQerrorMessage(connectionPtr_.get());
             if (isWorking_)
             {
                 handleFatalError();
@@ -352,22 +405,32 @@ void PgConnection::handleRead()
             {
                 if (!isPreparingStatement_)
                 {
+                    LOG_DEBUG << "Processing query result";
                     auto r = makeResult(std::move(res));
                     callback_(r);
                     callback_ = nullptr;
                     exceptionCallback_ = nullptr;
                 }
+                else
+                {
+                    LOG_TRACE << "Prepared statement result received";
+                }
             }
         }
     }
+
+    LOG_TRACE << "Processed " << resultCount << " PostgreSQL results";
+
     if (isWorking_)
     {
         if (isPreparingStatement_ && callback_)
         {
+            LOG_DEBUG << "Statement prepared, executing with parameters";
             doAfterPreparing();
         }
         else
         {
+            LOG_DEBUG << "Query processing completed";
             isWorking_ = false;
             isPreparingStatement_ = false;
             idleCb_();
@@ -376,11 +439,22 @@ void PgConnection::handleRead()
 
     // Check notification
     std::shared_ptr<PGnotify> notify;
+    int notificationCount = 0;
     while (
         (notify = std::shared_ptr<PGnotify>(PQnotifies(connectionPtr_.get()),
                                             [](PGnotify *p) { PQfreemem(p); })))
     {
+        notificationCount++;
+        LOG_TRACE << "Received PostgreSQL notification #" << notificationCount
+                  << " channel: " << notify->relname
+                  << " payload: " << notify->extra;
         messageCallback_({notify->relname}, {notify->extra});
+    }
+
+    if (notificationCount > 0)
+    {
+        LOG_DEBUG << "Processed " << notificationCount
+                  << " PostgreSQL notifications";
     }
 }
 
@@ -399,7 +473,7 @@ void PgConnection::doAfterPreparing()
                             formats_.data(),
                             0) == 0)
     {
-        LOG_ERROR << "send query error: "
+        LOG_ERROR << "Failed to send prepared query: "
                   << PQerrorMessage(connectionPtr_.get());
         if (isWorking_)
         {
@@ -420,6 +494,14 @@ void PgConnection::handleFatalError()
         auto exceptPtr = std::make_exception_ptr(
             Failure(PQerrorMessage(connectionPtr_.get())));
         exceptionCallback_(exceptPtr);
+    }
+
+    if (PQstatus(connectionPtr_.get()) != CONNECTION_OK)
+    {
+        LOG_ERROR << "Connection lost: "
+                  << PQerrorMessage(connectionPtr_.get());
+
+        handleClosed();
     }
 
     exceptionCallback_ = nullptr;
